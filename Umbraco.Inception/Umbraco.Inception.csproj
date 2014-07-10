@@ -200,6 +200,7 @@
     <Compile Include="Converters\UDateTimeConverter.cs" />
     <Compile Include="Converters\UDoubleConverter.cs" />
     <Compile Include="Converters\UIntegerConverter.cs" />
+    <Compile Include="Extensions\TypeExtensions.cs" />
     <Compile Include="Extensions\UmbracoCodeFirstExtensions.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>

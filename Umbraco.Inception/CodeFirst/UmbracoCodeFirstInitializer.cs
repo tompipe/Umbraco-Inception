@@ -95,7 +95,7 @@ namespace Umbraco.Inception.CodeFirst
             CreateTabs(newContentType, type, dataTypeService);
 
             //create properties on the generic tab
-            var propertiesOfRoot = type.GetProperties().Where(x => x.GetCustomAttribute<UmbracoPropertyAttribute>() != null);
+            var propertiesOfRoot = type.GetPropertiesWithAttribute<UmbracoPropertyAttribute>();
             foreach (var item in propertiesOfRoot)
             {
                 CreateProperty(newContentType, null, dataTypeService, true, item);
@@ -149,7 +149,7 @@ namespace Umbraco.Inception.CodeFirst
         /// <param name="dataTypeService"></param>
         private static void CreateTabs(IContentType newContentType, Type model, IDataTypeService dataTypeService)
         {
-            var properties = model.GetProperties().Where(x => x.DeclaringType == model && x.GetCustomAttribute<UmbracoTabAttribute>() != null).ToArray();
+            var properties = model.GetPropertiesWithAttribute<UmbracoTabAttribute>().Where(x => x.DeclaringType == model).ToArray();
             int length = properties.Length;
 
             for (int i = 0; i < length; i++)
@@ -174,7 +174,7 @@ namespace Umbraco.Inception.CodeFirst
         {
             //type is from TabBase
             Type type = propertyInfo.PropertyType;
-            var properties = type.GetProperties().Where(x => x.GetCustomAttribute<UmbracoPropertyAttribute>() != null);
+            var properties = type.GetPropertiesWithAttribute<UmbracoPropertyAttribute>();
             if (properties.Count() > 0)
             {
                 foreach (var item in properties)
@@ -305,7 +305,7 @@ namespace Umbraco.Inception.CodeFirst
         /// <param name="dataTypeService"></param>
         private static void VerifyProperties(IContentType contentType, Type type, IDataTypeService dataTypeService)
         {
-            var properties = type.GetProperties().Where(x => x.GetCustomAttribute<UmbracoTabAttribute>() != null).ToArray();
+            var properties = type.GetPropertiesWithAttribute<UmbracoTabAttribute>().ToArray();
             List<string> propertiesThatShouldExist = new List<string>();
 
             foreach (var propertyTab in properties)
@@ -319,7 +319,7 @@ namespace Umbraco.Inception.CodeFirst
                 propertiesThatShouldExist.AddRange(VerifyAllPropertiesOnTab(propertyTab, contentType, tabAttribute.Name, dataTypeService));
             }
 
-            var propertiesOfRoot = type.GetProperties().Where(x => x.GetCustomAttribute<UmbracoPropertyAttribute>() != null);
+            var propertiesOfRoot = type.GetPropertiesWithAttribute<UmbracoPropertyAttribute>();
             foreach (var item in propertiesOfRoot)
             {
                 //TODO: check for correct name
@@ -350,7 +350,7 @@ namespace Umbraco.Inception.CodeFirst
         private static IEnumerable<string> VerifyAllPropertiesOnTab(PropertyInfo propertyTab, IContentType contentType, string tabName, IDataTypeService dataTypeService)
         {
             Type type = propertyTab.PropertyType;
-            var properties = type.GetProperties().Where(x => x.GetCustomAttribute<UmbracoPropertyAttribute>() != null);
+            var properties = type.GetPropertiesWithAttribute<UmbracoPropertyAttribute>();
             if (properties.Count() > 0)
             {
                 List<string> propertyAliases = new List<string>();
