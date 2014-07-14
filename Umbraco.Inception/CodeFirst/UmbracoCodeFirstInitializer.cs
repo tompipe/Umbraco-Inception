@@ -1,4 +1,5 @@
-﻿using System;
+﻿using Epiphany.Extensions;
+using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -14,34 +15,120 @@ using Umbraco.Inception.Extensions;
 
 namespace Umbraco.Inception.CodeFirst
 {
-    public static class UmbracoCodeFirstInitializer
+    public class UmbracoCodeFirstInitializer
     {
-        private const string ViewsFolderDefaultLocation = "~/Views";
+        readonly IContentTypeService _contentTypeService;
+        readonly IFileService _fileService;
+        readonly IDataTypeService _dataTypeService;
+
+        public UmbracoCodeFirstInitializer() : this(ApplicationContext.Current.Services.ContentTypeService, ApplicationContext.Current.Services.FileService, ApplicationContext.Current.Services.DataTypeService)
+        {
+            // Default constructor without DI
+        }
+
+        public UmbracoCodeFirstInitializer(IContentTypeService contentSvc, IFileService fileSvc, IDataTypeService dataTypeSvc)
+        {
+            _contentTypeService = contentSvc;
+            _fileService = fileSvc;
+            _dataTypeService = dataTypeSvc;
+        }
 
         /// <summary>
         /// This method will create or update the Content Type in Umbraco.
         /// It's possible that you need to run this method a few times to create all relations between Content Types.
         /// </summary>
         /// <param name="type">The type of your model that contains an UmbracoContentTypeAttribute</param>
-        public static void CreateOrUpdateEntity(Type type)
+        public void CreateOrUpdateEntity(Type type)
         {
-            var contentTypeService = ApplicationContext.Current.Services.ContentTypeService;
-            var fileService = ApplicationContext.Current.Services.FileService;
-            var dataTypeService = ApplicationContext.Current.Services.DataTypeService;
-
-            UmbracoContentTypeAttribute attribute = type.GetCustomAttribute<UmbracoContentTypeAttribute>();
+            var attribute = type.GetCustomAttribute<UmbracoContentTypeAttribute>();
             if (attribute == null) return;
 
-            if (!contentTypeService.GetAllContentTypes().Any(x => x != null && x.Alias == attribute.ContentTypeAlias))
+            // ensure any heirarchy of types are persisted, and parent types are already created.
+            var types = type.GetBaseTypes(true).WithoutLast().ToList(); // everything inherits object, skip it
+
+            if (types.Last() == typeof(UmbracoGeneratedBase))
             {
-                CreateContentType(contentTypeService, fileService, attribute, type, dataTypeService);
+                var propertiesToAdd = new List<PropertyInfo>();
+                var tabsToAdd = new List<PropertyInfo>();
+                var parentAlias = string.Empty;
+                for (var i = types.Count - 2; i >= 0; i--) // skip last as it will be UmbracoGeneratedBase
+                {
+                    var t = types[i];
+
+                    // save the properties and tabs from this type
+                    propertiesToAdd.AddRange(t.GetPropertiesWithAttribute<UmbracoPropertyAttribute>());
+                    tabsToAdd.AddRange(t.GetPropertiesWithAttribute<UmbracoTabAttribute>());
+
+                    if (!t.IsAbstract)
+                    {
+                        var typeAttribute = t.GetCustomAttribute<UmbracoContentTypeAttribute>();
+                        if (typeAttribute != null)
+                        {
+                            // create/update this type, and add all inherited properties from abstract classes
+                            PersistContentType(t, typeAttribute, parentAlias, propertiesToAdd, tabsToAdd);
+                        }
+                        else
+                        {
+                            throw new Exception(string.Format("The type {0} does not have a UmbracoContentTypeAttribute", type.FullName));
+                        }
+
+                        parentAlias = typeAttribute.ContentTypeAlias;
+                        propertiesToAdd.Clear();
+                        tabsToAdd.Clear();
+                    }
+                }
             }
             else
             {
-                //update
-                IContentType contentType = contentTypeService.GetContentType(attribute.ContentTypeAlias);
-                UpdateContentType(contentTypeService, fileService, attribute, contentType, type, dataTypeService);
+                throw new Exception("The given type does not inherit from UmbracoGeneratedBase");
             }
+        }
+
+        private void PersistContentType(Type type, UmbracoContentTypeAttribute attribute, string parentAlias, IEnumerable<PropertyInfo> propertiesToAdd, IEnumerable<PropertyInfo> tabsToAdd)
+        {
+            var contentType = _contentTypeService.GetContentType(attribute.ContentTypeAlias) ?? CreateContentType(parentAlias);
+
+            contentType.Name = attribute.ContentTypeName;
+            contentType.Alias = attribute.ContentTypeAlias;
+            contentType.Icon = attribute.Icon;
+            contentType.AllowedAsRoot = attribute.AllowedAtRoot;
+            contentType.IsContainer = attribute.EnableListView;
+            contentType.AllowedContentTypes = FetchAllowedContentTypes(attribute.AllowedChildren);
+
+            if (attribute.CreateMatchingView)
+            {
+                CreateMatchingView(attribute, type, contentType);
+            }
+
+            //create tabs
+            CreateTabs(contentType, type, tabsToAdd);
+
+            //create properties with no tab specified
+            var propertiesOfRoot = type.GetPropertiesWithAttribute<UmbracoPropertyAttribute>().Concat(propertiesToAdd);
+            foreach (var item in propertiesOfRoot)
+            {
+                CreateProperty(contentType, null, item);
+            }
+
+            if (contentType.Id != 0) // if the content type is not yet saved, no need to do this
+            {
+                VerifyProperties(contentType, type);
+
+                //verify if a tab has no properties, if so remove
+                var propertyGroups = contentType.PropertyGroups.ToArray();
+                var length = propertyGroups.Length;
+                for (var i = 0; i < length; i++)
+                {
+                    if (propertyGroups[i].PropertyTypes.Count == 0)
+                    {
+                        //remove
+                        contentType.RemovePropertyGroup(propertyGroups[i].Name);
+                    }
+                }
+            }
+
+            //Save and persist the content Type
+            _contentTypeService.Save(contentType);
         }
 
         #region Create
@@ -49,72 +136,28 @@ namespace Umbraco.Inception.CodeFirst
         /// <summary>
         /// This method is called when the Content Type declared in the attribute hasn't been found in Umbraco
         /// </summary>
-        /// <param name="contentTypeService"></param>
-        /// <param name="fileService"></param>
-        /// <param name="attribute"></param>
-        /// <param name="type"></param>
-        /// <param name="dataTypeService"></param>
-        private static void CreateContentType(IContentTypeService contentTypeService, IFileService fileService,
-            UmbracoContentTypeAttribute attribute, Type type, IDataTypeService dataTypeService)
+        /// <param name="parentAlias"></param>
+        private IContentType CreateContentType(string parentAlias)
         {
-            IContentType newContentType;
-            Type parentType = type.BaseType;
-            if (parentType != null && parentType != typeof(UmbracoGeneratedBase) && parentType.GetBaseTypes(false).Any(x => x == typeof(UmbracoGeneratedBase)))
+            var parentContentTypeId = -1;
+            if (!string.IsNullOrEmpty(parentAlias))
             {
-                UmbracoContentTypeAttribute parentAttribute = parentType.GetCustomAttribute<UmbracoContentTypeAttribute>();
-                if (parentAttribute != null)
-                {
-                    string parentAlias = parentAttribute.ContentTypeAlias;
-                    IContentType parentContentType = contentTypeService.GetContentType(parentAlias);
-                    newContentType = new ContentType(parentContentType);
-                }
-                else
-                {
-                    throw new Exception("The given base class has no UmbracoContentTypeAttribute");
-                }
-            }
-            else
-            {
-                newContentType = new ContentType(-1);
+                var parentContentType = _contentTypeService.GetContentType(parentAlias);
+                parentContentTypeId = parentContentType.Id;
             }
 
-            newContentType.Name = attribute.ContentTypeName;
-            newContentType.Alias = attribute.ContentTypeAlias;
-            newContentType.Icon = attribute.Icon;
-
-            if (attribute.CreateMatchingView)
-            {
-                CreateMatchingView(fileService, attribute, type, newContentType);
-            }
-
-            newContentType.AllowedAsRoot = attribute.AllowedAtRoot;
-            newContentType.IsContainer = attribute.EnableListView;
-            newContentType.AllowedContentTypes = FetchAllowedContentTypes(attribute.AllowedChildren, contentTypeService);
-
-            //create tabs
-            CreateTabs(newContentType, type, dataTypeService);
-
-            //create properties on the generic tab
-            var propertiesOfRoot = type.GetPropertiesWithAttribute<UmbracoPropertyAttribute>();
-            foreach (var item in propertiesOfRoot)
-            {
-                CreateProperty(newContentType, null, dataTypeService, true, item);
-            }
-
-            //Save and persist the content Type
-            contentTypeService.Save(newContentType, 0);
+            return new ContentType(parentContentTypeId);
         }
 
         /// <summary>
         /// Creates a View if specified in the attribute
         /// </summary>
-        /// <param name="fileService"></param>
         /// <param name="attribute"></param>
         /// <param name="type"></param>
         /// <param name="newContentType"></param>
-        private static void CreateMatchingView(IFileService fileService, UmbracoContentTypeAttribute attribute, Type type, IContentType newContentType)
+        private void CreateMatchingView(UmbracoContentTypeAttribute attribute, Type type, IContentType newContentType)
         {
-            var currentTemplate = fileService.GetTemplate(attribute.ContentTypeAlias) as Template;
+            var currentTemplate = _fileService.GetTemplate(attribute.ContentTypeAlias) as Template;
             if (currentTemplate == null)
             {
                 string templatePath;
@@ -131,7 +174,7 @@ namespace Umbraco.Inception.CodeFirst
                 }
 
                 currentTemplate = new Template(templatePath, attribute.ContentTypeName, attribute.ContentTypeAlias);
-                CreateViewFile(attribute.MasterTemplate, currentTemplate, type, fileService);
+                CreateViewFile(attribute.MasterTemplate, currentTemplate, type);
             }
 
             newContentType.AllowedTemplates = new ITemplate[] { currentTemplate };
@@ -146,19 +189,19 @@ namespace Umbraco.Inception.CodeFirst
         /// </summary>
         /// <param name="newContentType"></param>
         /// <param name="model"></param>
-        /// <param name="dataTypeService"></param>
-        private static void CreateTabs(IContentType newContentType, Type model, IDataTypeService dataTypeService)
+        /// <param name="tabsToAdd"></param>
+        private void CreateTabs(IContentType newContentType, Type model, IEnumerable<PropertyInfo> tabsToAdd)
         {
-            var properties = model.GetPropertiesWithAttribute<UmbracoTabAttribute>().Where(x => x.DeclaringType == model).ToArray();
-            int length = properties.Length;
+            var properties = model.GetPropertiesWithAttribute<UmbracoTabAttribute>().Where(x => x.DeclaringType == model).Concat(tabsToAdd).ToArray();
+            var length = properties.Length;
 
-            for (int i = 0; i < length; i++)
+            for (var i = 0; i < length; i++)
             {
                 var tabAttribute = properties[i].GetCustomAttribute<UmbracoTabAttribute>();
 
                 newContentType.AddPropertyGroup(tabAttribute.Name);
 
-                CreateProperties(properties[i], newContentType, tabAttribute.Name, dataTypeService);
+                CreateProperties(properties[i], newContentType, tabAttribute.Name);
             }
         }
 
@@ -168,18 +211,16 @@ namespace Umbraco.Inception.CodeFirst
         /// <param name="propertyInfo"></param>
         /// <param name="newContentType"></param>
         /// <param name="tabName"></param>
-        /// <param name="dataTypeService"></param>
-        /// <param name="atTabGeneric"></param>
-        private static void CreateProperties(PropertyInfo propertyInfo, IContentType newContentType, string tabName, IDataTypeService dataTypeService, bool atTabGeneric = false)
+        private void CreateProperties(PropertyInfo propertyInfo, IContentType newContentType, string tabName)
         {
             //type is from TabBase
-            Type type = propertyInfo.PropertyType;
-            var properties = type.GetPropertiesWithAttribute<UmbracoPropertyAttribute>();
-            if (properties.Count() > 0)
+            var type = propertyInfo.PropertyType;
+            var properties = type.GetPropertiesWithAttribute<UmbracoPropertyAttribute>().ToList();
+            if (properties.Any())
             {
                 foreach (var item in properties)
                 {
-                    CreateProperty(newContentType, tabName, dataTypeService, atTabGeneric, item);
+                    CreateProperty(newContentType, tabName, item);
                 }
             }
         }
@@ -189,32 +230,32 @@ namespace Umbraco.Inception.CodeFirst
         /// </summary>
         /// <param name="newContentType"></param>
         /// <param name="tabName"></param>
-        /// <param name="dataTypeService"></param>
-        /// <param name="atTabGeneric"></param>
         /// <param name="item"></param>
-        private static void CreateProperty(IContentType newContentType, string tabName, IDataTypeService dataTypeService, bool atTabGeneric, PropertyInfo item)
+        private void CreateProperty(IContentTypeBase newContentType, string tabName, MemberInfo item)
         {
-            UmbracoPropertyAttribute attribute = item.GetCustomAttribute<UmbracoPropertyAttribute>();
+            var attribute = item.GetCustomAttribute<UmbracoPropertyAttribute>();
 
             IDataTypeDefinition dataTypeDef;
             if (string.IsNullOrEmpty(attribute.DataTypeInstanceName))
             {
-                dataTypeDef = dataTypeService.GetDataTypeDefinitionByPropertyEditorAlias(attribute.DataType).FirstOrDefault();
+                dataTypeDef = _dataTypeService.GetDataTypeDefinitionByPropertyEditorAlias(attribute.DataType).FirstOrDefault();
             }
             else
             {
-                dataTypeDef = dataTypeService.GetDataTypeDefinitionByPropertyEditorAlias(attribute.DataType).FirstOrDefault(x => x.Name == attribute.DataTypeInstanceName);
+                dataTypeDef = _dataTypeService.GetDataTypeDefinitionByPropertyEditorAlias(attribute.DataType).FirstOrDefault(x => x.Name == attribute.DataTypeInstanceName);
             }
 
             if (dataTypeDef != null)
             {
-                PropertyType propertyType = new PropertyType(dataTypeDef);
-                propertyType.Name = attribute.Name;
-                propertyType.Alias = (atTabGeneric ? attribute.Alias : UmbracoCodeFirstExtensions.HyphenToUnderscore(UmbracoCodeFirstExtensions.ParseUrl(attribute.Alias + "_" + tabName, false)));
-                propertyType.Description = attribute.Description;
-                propertyType.Mandatory = attribute.Mandatory;
+                var propertyType = new PropertyType(dataTypeDef)
+                {
+                    Name = attribute.Name,
+                    Alias = (string.IsNullOrEmpty(tabName) ? attribute.Alias : UmbracoCodeFirstExtensions.HyphenToUnderscore(UmbracoCodeFirstExtensions.ParseUrl(attribute.Alias + "_" + tabName, false))),
+                    Description = attribute.Description,
+                    Mandatory = attribute.Mandatory
+                };
 
-                if (atTabGeneric)
+                if (string.IsNullOrEmpty(tabName))
                 {
                     newContentType.AddPropertyType(propertyType);
                 }
@@ -229,107 +270,35 @@ namespace Umbraco.Inception.CodeFirst
 
         #region Update
 
-        /// <summary>
-        /// Update the existing content Type based on the data in the attributes
-        /// </summary>
-        /// <param name="contentTypeService"></param>
-        /// <param name="fileService"></param>
-        /// <param name="attribute"></param>
-        /// <param name="contentType"></param>
-        /// <param name="type"></param>
-        /// <param name="dataTypeService"></param>
-        private static void UpdateContentType(IContentTypeService contentTypeService, IFileService fileService, UmbracoContentTypeAttribute attribute, IContentType contentType, Type type, IDataTypeService dataTypeService)
-        {
-            contentType.Name = attribute.ContentTypeName;
-            contentType.Alias = attribute.ContentTypeAlias;
-            contentType.Icon = attribute.Icon;
-            contentType.IsContainer = attribute.EnableListView;
-            contentType.AllowedContentTypes = FetchAllowedContentTypes(attribute.AllowedChildren, contentTypeService);
-            contentType.AllowedAsRoot = attribute.AllowedAtRoot;
-
-            Type parentType = type.BaseType;
-            if (parentType != null && parentType != typeof(UmbracoGeneratedBase) && parentType.GetBaseTypes(false).Any(x => x == typeof(UmbracoGeneratedBase)))
-            {
-                UmbracoContentTypeAttribute parentAttribute = parentType.GetCustomAttribute<UmbracoContentTypeAttribute>();
-                if (parentAttribute != null)
-                {
-                    string parentAlias = parentAttribute.ContentTypeAlias;
-                    IContentType parentContentType = contentTypeService.GetContentType(parentAlias);
-                    contentType.ParentId = parentContentType.Id;
-                }
-                else
-                {
-                    throw new Exception("The given base class has no UmbracoContentTypeAttribute");
-                }
-            }
-
-            if (attribute.CreateMatchingView)
-            {
-                CreateMatchingView(fileService, attribute, type, contentType);
-
-                //Template currentTemplate = fileService.GetTemplate(attribute.ContentTypeAlias) as Template;
-                //if (currentTemplate == null)
-                //{
-                //    //there should be a template but there isn't so we create one
-                //    currentTemplate = new Template("~/Views/" + attribute.ContentTypeAlias + ".cshtml", attribute.ContentTypeName, attribute.ContentTypeAlias);
-                //    CreateViewFile(attribute.ContentTypeAlias, attribute.MasterTemplate, currentTemplate, type, fileService);
-                //    fileService.SaveTemplate(currentTemplate, 0);
-                //}
-                //contentType.AllowedTemplates = new ITemplate[] { currentTemplate };
-                //contentType.SetDefaultTemplate(currentTemplate);
-            }
-
-            VerifyProperties(contentType, type, dataTypeService);
-
-            //verify if a tab has no properties, if so remove
-            var propertyGroups = contentType.PropertyGroups.ToArray();
-            int length = propertyGroups.Length;
-            for (int i = 0; i < length; i++)
-            {
-                if (propertyGroups[i].PropertyTypes.Count == 0)
-                {
-                    //remove
-                    contentType.RemovePropertyGroup(propertyGroups[i].Name);
-                }
-            }
-
-            //persist
-            contentTypeService.Save(contentType, 0);
-        }
 
         /// <summary>
         /// Loop through all properties and remove existing ones if necessary
         /// </summary>
         /// <param name="contentType"></param>
         /// <param name="type"></param>
-        /// <param name="dataTypeService"></param>
-        private static void VerifyProperties(IContentType contentType, Type type, IDataTypeService dataTypeService)
+        private void VerifyProperties(IContentType contentType, Type type)
         {
             var properties = type.GetPropertiesWithAttribute<UmbracoTabAttribute>().ToArray();
-            List<string> propertiesThatShouldExist = new List<string>();
+            var propertiesThatShouldExist = new List<string>();
 
             foreach (var propertyTab in properties)
             {
                 var tabAttribute = propertyTab.GetCustomAttribute<UmbracoTabAttribute>();
-                if (!contentType.PropertyGroups.Any(x => x.Name == tabAttribute.Name))
+                if (contentType.PropertyGroups.All(x => x.Name != tabAttribute.Name))
                 {
                     contentType.AddPropertyGroup(tabAttribute.Name);
                 }
 
-                propertiesThatShouldExist.AddRange(VerifyAllPropertiesOnTab(propertyTab, contentType, tabAttribute.Name, dataTypeService));
+                propertiesThatShouldExist.AddRange(VerifyAllPropertiesOnTab(propertyTab, contentType, tabAttribute.Name));
             }
 
             var propertiesOfRoot = type.GetPropertiesWithAttribute<UmbracoPropertyAttribute>();
-            foreach (var item in propertiesOfRoot)
-            {
-                //TODO: check for correct name
-                propertiesThatShouldExist.Add(VerifyExistingProperty(contentType, null, dataTypeService, item, true));
-            }
+            propertiesThatShouldExist.AddRange(propertiesOfRoot.Select(item => VerifyExistingProperty(contentType, null, item, true)));
 
             //loop through all the properties on the ContentType to see if they should be removed;
             var existingUmbracoProperties = contentType.PropertyTypes.ToArray();
-            int length = contentType.PropertyTypes.Count();
-            for (int i = 0; i < length; i++)
+            var length = contentType.PropertyTypes.Count();
+            for (var i = 0; i < length; i++)
             {
                 if (!propertiesThatShouldExist.Contains(existingUmbracoProperties[i].Alias))
                 {
@@ -345,41 +314,35 @@ namespace Umbraco.Inception.CodeFirst
         /// <param name="propertyTab"></param>
         /// <param name="contentType"></param>
         /// <param name="tabName"></param>
-        /// <param name="dataTypeService"></param>
         /// <returns></returns>
-        private static IEnumerable<string> VerifyAllPropertiesOnTab(PropertyInfo propertyTab, IContentType contentType, string tabName, IDataTypeService dataTypeService)
+        private IEnumerable<string> VerifyAllPropertiesOnTab(PropertyInfo propertyTab, IContentTypeBase contentType, string tabName)
         {
-            Type type = propertyTab.PropertyType;
-            var properties = type.GetPropertiesWithAttribute<UmbracoPropertyAttribute>();
-            if (properties.Count() > 0)
+            var type = propertyTab.PropertyType;
+            var properties = type.GetPropertiesWithAttribute<UmbracoPropertyAttribute>().ToList();
+            if (properties.Any())
             {
-                List<string> propertyAliases = new List<string>();
-                foreach (var item in properties)
-                {
-                    propertyAliases.Add(VerifyExistingProperty(contentType, tabName, dataTypeService, item));
-                }
-                return propertyAliases;
+                return properties.Select(item => VerifyExistingProperty(contentType, tabName, item)).ToList();
             }
             return new string[0];
         }
 
-        private static string VerifyExistingProperty(IContentType contentType, string tabName, IDataTypeService dataTypeService, PropertyInfo item, bool atGenericTab = false)
+        private string VerifyExistingProperty(IContentTypeBase contentType, string tabName, MemberInfo item, bool atGenericTab = false)
         {
-            UmbracoPropertyAttribute attribute = item.GetCustomAttribute<UmbracoPropertyAttribute>();
+            var attribute = item.GetCustomAttribute<UmbracoPropertyAttribute>();
             IDataTypeDefinition dataTypeDef;
             if (string.IsNullOrEmpty(attribute.DataTypeInstanceName))
             {
-                dataTypeDef = dataTypeService.GetDataTypeDefinitionByPropertyEditorAlias(attribute.DataType).FirstOrDefault();
+                dataTypeDef = _dataTypeService.GetDataTypeDefinitionByPropertyEditorAlias(attribute.DataType).FirstOrDefault();
             }
             else
             {
-                dataTypeDef = dataTypeService.GetDataTypeDefinitionByPropertyEditorAlias(attribute.DataType).FirstOrDefault(x => x.Name == attribute.DataTypeInstanceName);
+                dataTypeDef = _dataTypeService.GetDataTypeDefinitionByPropertyEditorAlias(attribute.DataType).FirstOrDefault(x => x.Name == attribute.DataTypeInstanceName);
             }
 
             if (dataTypeDef != null)
             {
                 PropertyType property;
-                bool alreadyExisted = contentType.PropertyTypeExists(attribute.Alias);
+                var alreadyExisted = contentType.PropertyTypeExists(attribute.Alias);
                 // TODO: Added attribute.Tab != null after Generic Properties add, is this bulletproof?
                 if (alreadyExisted && attribute.Tab != null)
                 {
@@ -421,50 +384,40 @@ namespace Umbraco.Inception.CodeFirst
         /// Gets the allowed children
         /// </summary>
         /// <param name="types"></param>
-        /// <param name="contentTypeService"></param>
         /// <returns></returns>
-        private static IEnumerable<ContentTypeSort> FetchAllowedContentTypes(Type[] types, IContentTypeService contentTypeService)
+        private IEnumerable<ContentTypeSort> FetchAllowedContentTypes(IEnumerable<Type> types)
         {
             if (types == null) return new ContentTypeSort[0];
 
-            List<ContentTypeSort> contentTypeSorts = new List<ContentTypeSort>();
+            var contentTypeSorts = new List<ContentTypeSort>();
 
-            List<string> aliases = GetAliasesFromTypes(types);
+            var aliases = GetAliasesFromTypes(types);
 
-            var contentTypes = contentTypeService.GetAllContentTypes().Where(x => aliases.Contains(x.Alias)).ToArray();
+            var contentTypes = _contentTypeService.GetAllContentTypes().Where(x => aliases.Contains(x.Alias)).ToArray();
 
-            int length = contentTypes.Length;
-            for (int i = 0; i < length; i++)
+            var length = contentTypes.Length;
+            for (var i = 0; i < length; i++)
             {
-                ContentTypeSort sort = new ContentTypeSort();
-                sort.Alias = contentTypes[i].Alias;
-                int id = contentTypes[i].Id;
-                sort.Id = new Lazy<int>(() => { return id; });
-                sort.SortOrder = i;
+                var id = contentTypes[i].Id;
+                var sort = new ContentTypeSort
+                {
+                    Alias = contentTypes[i].Alias,
+                    Id = new Lazy<int>(() => id),
+                    SortOrder = i
+                };
                 contentTypeSorts.Add(sort);
             }
             return contentTypeSorts;
         }
 
-        private static List<string> GetAliasesFromTypes(Type[] types)
+        private static List<string> GetAliasesFromTypes(IEnumerable<Type> types)
         {
-            List<string> aliases = new List<string>();
-
-            foreach (Type type in types)
-            {
-                UmbracoContentTypeAttribute attribute = type.GetCustomAttribute<UmbracoContentTypeAttribute>();
-                if (attribute != null)
-                {
-                    aliases.Add(attribute.ContentTypeAlias);
-                }
-            }
-
-            return aliases;
+            return (from type in types select type.GetCustomAttribute<UmbracoContentTypeAttribute>() into attribute where attribute != null select attribute.ContentTypeAlias).ToList();
         }
 
-        private static void CreateViewFile(string masterTemplate, Template template, Type type, IFileService fileService)
+        private void CreateViewFile(string masterTemplate, Template template, Type type)
         {
-            string physicalViewFileLocation = HostingEnvironment.MapPath(template.Path);
+            var physicalViewFileLocation = HostingEnvironment.MapPath(template.Path);
             if (string.IsNullOrEmpty(physicalViewFileLocation))
             {
                 throw new InvalidOperationException(string.Format(CultureInfo.InvariantCulture, "Failed to {0} to a physical location", template.Path));
@@ -482,7 +435,7 @@ namespace Umbraco.Inception.CodeFirst
             //I'll do a pull request to change this
             //TemplateNode rootTemplate = fileService.GetTemplateNode(master);
             //template.MasterTemplateId = new Lazy<int>(() => { return rootTemplate.Template.Id; });
-            fileService.SaveTemplate(template, 0);
+            _fileService.SaveTemplate(template);
 
             //    //TODO: in Umbraco 7.1 it will be possible to set the master template of the newly created template
             //    //https://github.com/umbraco/Umbraco-CMS/pull/294
